@@ -66,6 +66,12 @@ import socket
 import sqlite3
 import ssl
 import email
+try:
+  import psycopg2
+  import psycopg2.extras
+  PSYCOPG2_AVAILABLE = True
+except ImportError:
+  PSYCOPG2_AVAILABLE = False
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import (format_datetime,
@@ -245,6 +251,29 @@ where last restore left off.')
     dest='config_folder',
     help='Optional: Alternate folder to store config and credentials',
     default=getProgPath())
+  parser.add_argument('--use-postgres',
+    action='store_true',
+    dest='use_postgres',
+    help='Use PostgreSQL database instead of SQLite file storage')
+  parser.add_argument('--postgres-host',
+    dest='postgres_host',
+    default='localhost',
+    help='PostgreSQL database host (default: localhost)')
+  parser.add_argument('--postgres-port',
+    dest='postgres_port',
+    type=int,
+    default=5432,
+    help='PostgreSQL database port (default: 5432)')
+  parser.add_argument('--postgres-db',
+    dest='postgres_db',
+    default='emailvault',
+    help='PostgreSQL database name (default: emailvault)')
+  parser.add_argument('--postgres-user',
+    dest='postgres_user',
+    help='PostgreSQL database username')
+  parser.add_argument('--postgres-password',
+    dest='postgres_password',
+    help='PostgreSQL database password')
   parser.add_argument('--cleanup',
           action='store_true',
           dest='cleanup',
@@ -1488,6 +1517,18 @@ go grab a cup of coffee and then try this command again.
   print(scopes_failed)
   sys.exit(3)
 
+def message_is_backed_up_postgresql(gmail_uid, pgcur):
+  """Check if message is already backed up in PostgreSQL"""
+  try:
+    pgcur.execute('''
+      SELECT vaultid FROM maildata WHERE uid = %s
+    ''', (gmail_uid,))
+    result = pgcur.fetchone()
+    return result is not None
+  except psycopg2.Error as e:
+    print(f"PostgreSQL error: {e}")
+    return False
+
 def message_is_backed_up(message_num, sqlcur, sqlconn, backup_folder):
     try:
       sqlcur.execute('''
@@ -1631,6 +1672,131 @@ def rewrite_line(mystring):
   else:
     print()
   print(mystring, end='\r')
+
+def connectPostgreSQL():
+  """Establish PostgreSQL database connection"""
+  if not PSYCOPG2_AVAILABLE:
+    print("ERROR: psycopg2 not available. Please install with: pip install psycopg2-binary")
+    sys.exit(1)
+  
+  try:
+    conn = psycopg2.connect(
+      host=options.postgres_host,
+      port=options.postgres_port,
+      database=options.postgres_db,
+      user=options.postgres_user,
+      password=options.postgres_password
+    )
+    conn.autocommit = False
+    return conn
+  except psycopg2.Error as e:
+    print(f"ERROR: Cannot connect to PostgreSQL database: {e}")
+    sys.exit(1)
+
+def initializePostgreSQL(pgconn, email):
+  """Initialize PostgreSQL database schema"""
+  pgcur = pgconn.cursor()
+  
+  # Create primary maildata table
+  pgcur.execute('''
+    CREATE TABLE IF NOT EXISTS maildata (
+      vaultid SERIAL PRIMARY KEY,
+      "Message-ID" VARCHAR NOT NULL,
+      "Original-File" VARCHAR NOT NULL,
+      "Message-Path" VARCHAR NOT NULL,
+      "Derivatives-Path" VARCHAR NOT NULL,
+      attachments INTEGER DEFAULT 0,
+      "Full Headers" JSONB NOT NULL,
+      date TIMESTAMP WITH TIME ZONE,
+      "From" VARCHAR,
+      "To" VARCHAR,
+      cc VARCHAR,
+      bcc VARCHAR,
+      subject VARCHAR,
+      "Content-Type" VARCHAR,
+      mboxusername VARCHAR,
+      error TEXT,
+      defects TEXT,
+      defects_categories TEXT,
+      delivered_to VARCHAR,
+      received VARCHAR,
+      uid TEXT,
+      internal_date TIMESTAMP WITH TIME ZONE,
+      labels TEXT[] DEFAULT '{}'
+    )
+  ''')
+  
+  # Create maildetail table
+  pgcur.execute('''
+    CREATE TABLE IF NOT EXISTS maildetail (
+      vaultid INTEGER REFERENCES maildata(vaultid) ON DELETE CASCADE,
+      "Message-ID" VARCHAR,
+      "Body-Original" TEXT,
+      "Body-PlainText" TEXT,
+      text_not_managed TEXT
+    )
+  ''')
+  
+  # Create mailattachments table
+  pgcur.execute('''
+    CREATE TABLE IF NOT EXISTS mailattachments (
+      vaultid INTEGER REFERENCES maildata(vaultid) ON DELETE CASCADE,
+      "Message-ID" VARCHAR,
+      "Content-Type" VARCHAR,
+      "Content-Encoding" VARCHAR,
+      "Content-Filename" VARCHAR,
+      "Content-Data" BYTEA
+    )
+  ''')
+  
+  # Create audit_log table
+  pgcur.execute('''
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id SERIAL PRIMARY KEY,
+      external_username VARCHAR,
+      action VARCHAR,
+      details JSONB,
+      timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    )
+  ''')
+  
+  # Create settings table for compatibility
+  pgcur.execute('''
+    CREATE TABLE IF NOT EXISTS settings (
+      name VARCHAR PRIMARY KEY,
+      value TEXT
+    )
+  ''')
+  
+  # Insert settings
+  pgcur.execute('''
+    INSERT INTO settings (name, value) VALUES (%s, %s)
+    ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value
+  ''', ('email_address', email))
+  
+  pgcur.execute('''
+    INSERT INTO settings (name, value) VALUES (%s, %s)
+    ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value
+  ''', ('db_version', __db_schema_version__))
+  
+  # Create indexes for performance
+  pgcur.execute('''
+    CREATE INDEX IF NOT EXISTS idx_maildata_messageid 
+    ON maildata("Message-ID")
+  ''')
+  
+  pgcur.execute('''
+    CREATE INDEX IF NOT EXISTS idx_maildata_mboxusername_messageid 
+    ON maildata(mboxusername, "Message-ID")
+  ''')
+  
+  pgcur.execute('''
+    CREATE INDEX IF NOT EXISTS idx_maildata_labels 
+    ON maildata USING GIN(labels)
+  ''')
+  
+  pgconn.commit()
+  pgcur.close()
 
 def initializeDB(sqlconn, email):
   sqlconn.execute('''CREATE TABLE settings (name TEXT PRIMARY KEY, value TEXT);''')
@@ -1820,6 +1986,252 @@ def backup_chat(request_id, response, exception):
     sqlcur.execute("""
        INSERT INTO labels (message_num, label) VALUES (?, ?)""",
                           (message_num, label))
+
+def parse_email_message(raw_message):
+  """Parse raw email message and extract components for PostgreSQL storage"""
+  try:
+    # Parse the email message
+    msg = email.message_from_bytes(raw_message)
+    
+    # Extract basic headers
+    message_id = msg.get('Message-ID', '').strip('<>')
+    if not message_id:
+      # Generate a dummy Message-ID if missing
+      message_id = f'<gyb-generated-{hashlib.md5(raw_message).hexdigest()}@gyb.local>'
+    
+    from_header = msg.get('From', '')
+    to_header = msg.get('To', '')
+    cc_header = msg.get('Cc', '')
+    bcc_header = msg.get('Bcc', '')
+    subject = msg.get('Subject', '')
+    content_type = msg.get('Content-Type', '')
+    date_header = msg.get('Date', '')
+    
+    # Parse date
+    parsed_date = None
+    if date_header:
+      try:
+        parsed_date = email.utils.parsedate_to_datetime(date_header)
+      except:
+        pass
+    
+    # Create full headers JSON
+    full_headers = {}
+    for key, value in msg.items():
+      if key not in full_headers:
+        full_headers[key] = []
+      full_headers[key].append(value)
+    
+    # Extract body parts
+    body_original = ""
+    body_plaintext = ""
+    attachments = []
+    
+    # Walk through message parts
+    attachment_count = 0
+    for part in msg.walk():
+      content_type_part = part.get_content_type()
+      content_disposition = part.get('Content-Disposition', '')
+      
+      if part.is_multipart():
+        continue
+        
+      if content_type_part == 'text/plain' and 'attachment' not in content_disposition:
+        try:
+          payload = part.get_payload(decode=True)
+          if payload:
+            body_plaintext += payload.decode('utf-8', errors='ignore')
+        except:
+          pass
+      elif content_type_part == 'text/html' and 'attachment' not in content_disposition:
+        try:
+          payload = part.get_payload(decode=True)
+          if payload:
+            body_original += payload.decode('utf-8', errors='ignore')
+        except:
+          pass
+      elif 'attachment' in content_disposition or part.get_filename():
+        # This is an attachment
+        filename = part.get_filename() or f'attachment_{attachment_count}'
+        content_encoding = part.get('Content-Transfer-Encoding', '')
+        try:
+          content_data = part.get_payload(decode=True)
+          if content_data:
+            attachments.append({
+              'filename': filename,
+              'content_type': content_type_part,
+              'content_encoding': content_encoding,
+              'content_data': content_data
+            })
+            attachment_count += 1
+        except:
+          pass
+    
+    # If no body text found, try to get something from the message
+    if not body_plaintext and not body_original:
+      try:
+        if msg.is_multipart():
+          for part in msg.get_payload():
+            if hasattr(part, 'get_payload'):
+              payload = part.get_payload(decode=True)
+              if payload:
+                body_original = payload.decode('utf-8', errors='ignore')
+                break
+        else:
+          payload = msg.get_payload(decode=True)
+          if payload:
+            body_original = payload.decode('utf-8', errors='ignore')
+      except:
+        pass
+    
+    return {
+      'message_id': message_id,
+      'from': from_header,
+      'to': to_header,
+      'cc': cc_header,
+      'bcc': bcc_header,
+      'subject': subject,
+      'content_type': content_type,
+      'date': parsed_date,
+      'full_headers': full_headers,
+      'body_original': body_original,
+      'body_plaintext': body_plaintext,
+      'attachments': attachments,
+      'attachment_count': len(attachments)
+    }
+  except Exception as e:
+    print(f"Error parsing email message: {e}")
+    return None
+
+def backup_message_postgresql(request_id, response, exception):
+  """PostgreSQL version of backup_message function"""
+  if exception is not None:
+    print(exception)
+    return
+    
+  labelIds = response.get('labelIds', [])
+  if 'CHATS' in labelIds or 'CHAT' in labelIds: # skip CHATS
+    return
+    
+  labels = labelIdsToLabels(labelIds)
+  gmail_uid = response['id']
+  message_time = int(response['internalDate'])/1000
+  
+  try:
+    internal_date = datetime.datetime.fromtimestamp(message_time, tz=datetime.timezone.utc)
+  except (OSError, IOError, OverflowError):
+    internal_date = datetime.datetime.fromtimestamp(86400, tz=datetime.timezone.utc)
+  
+  raw_message = str(response['raw'])
+  full_message = base64.urlsafe_b64decode(raw_message)
+  
+  # Parse the email message
+  parsed = parse_email_message(full_message)
+  if not parsed:
+    print(f"Failed to parse message {gmail_uid}")
+    return
+  
+  # Check for duplicates
+  sqlcur.execute('''
+    SELECT vaultid FROM maildata 
+    WHERE "Message-ID" = %s AND mboxusername = %s
+  ''', (parsed['message_id'], options.email))
+  
+  existing = sqlcur.fetchone()
+  if existing:
+    print(f"Duplicate message found: {parsed['message_id']}")
+    return
+  
+  try:
+    # Insert into maildata table
+    sqlcur.execute('''
+      INSERT INTO maildata (
+        "Message-ID", "Original-File", "Message-Path", "Derivatives-Path",
+        attachments, "Full Headers", date, "From", "To", cc, bcc, subject,
+        "Content-Type", mboxusername, uid, internal_date, labels
+      ) VALUES (
+        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+      ) RETURNING vaultid
+    ''', (
+      parsed['message_id'],
+      f"{gmail_uid}.eml",  # Original-File
+      "postgresql_storage",  # Message-Path  
+      "postgresql_storage",  # Derivatives-Path
+      parsed['attachment_count'],
+      json.dumps(parsed['full_headers']),
+      parsed['date'],
+      parsed['from'],
+      parsed['to'],
+      parsed['cc'],
+      parsed['bcc'],
+      parsed['subject'],
+      parsed['content_type'],
+      options.email,  # mboxusername
+      gmail_uid,
+      internal_date,
+      labels
+    ))
+    
+    vaultid = sqlcur.fetchone()[0]
+    
+    # Insert into maildetail table
+    sqlcur.execute('''
+      INSERT INTO maildetail (
+        vaultid, "Message-ID", "Body-Original", "Body-PlainText"
+      ) VALUES (%s, %s, %s, %s)
+    ''', (
+      vaultid,
+      parsed['message_id'],
+      parsed['body_original'],
+      parsed['body_plaintext']
+    ))
+    
+    # Insert attachments
+    for attachment in parsed['attachments']:
+      sqlcur.execute('''
+        INSERT INTO mailattachments (
+          vaultid, "Message-ID", "Content-Type", "Content-Encoding",
+          "Content-Filename", "Content-Data"
+        ) VALUES (%s, %s, %s, %s, %s, %s)
+      ''', (
+        vaultid,
+        parsed['message_id'],
+        attachment['content_type'],
+        attachment['content_encoding'],
+        attachment['filename'],
+        attachment['content_data']
+      ))
+    
+    # Log successful operation
+    sqlcur.execute('''
+      INSERT INTO audit_log (external_username, action, details)
+      VALUES (%s, %s, %s)
+    ''', (
+      options.email,
+      'backup_message',
+      json.dumps({
+        'message_id': parsed['message_id'],
+        'gmail_uid': gmail_uid,
+        'vaultid': vaultid,
+        'labels': labels
+      })
+    ))
+    
+  except Exception as e:
+    print(f"Error storing message {gmail_uid}: {e}")
+    # Log failed operation
+    sqlcur.execute('''
+      INSERT INTO audit_log (external_username, action, details)
+      VALUES (%s, %s, %s)
+    ''', (
+      options.email,
+      'backup_message_failed',
+      json.dumps({
+        'message_id': parsed['message_id'],
+        'gmail_uid': gmail_uid,
+        'error': str(e)
+      })
+    ))
 
 def backup_message(request_id, response, exception):
   if exception is not None:
@@ -2131,43 +2543,70 @@ def main(argv):
         % options.local_folder)
       sys.exit(3)
 
-  sqldbfile = os.path.join(options.local_folder, 'msg-db.sqlite')
-  # Do we need to initialize a new database?
-  newDB = not os.path.isfile(sqldbfile)
-  
-  # If we're not doing a estimate or if the db file actually exists we open it
-  # (creates db if it doesn't exist)
-  if options.action not in ['count', 'purge', 'purge-labels', 'print-labels',
-    'quota', 'revoke', 'create-label']:
-    if options.action not in ['estimate', 'restore-mbox', 'restore-group'] or os.path.isfile(sqldbfile):
-      print("\nUsing backup folder %s" % options.local_folder)
-      global sqlconn
-      global sqlcur
-      sqlite3.register_adapter(datetime.date, adapt_date_iso)
-      sqlite3.register_adapter(datetime.datetime, adapt_datetime_iso)
-      sqlite3.register_adapter(datetime.datetime, adapt_datetime_epoch)
-      sqlite3.register_converter("date", convert_date)
-      sqlite3.register_converter("datetime", convert_datetime)
-      sqlite3.register_converter("timestamp", convert_timestamp)
-      sqlconn = sqlite3.connect(sqldbfile,
-        detect_types=sqlite3.PARSE_DECLTYPES)
-      sqlcur = sqlconn.cursor()
-      if newDB:
-        initializeDB(sqlconn, options.email)
-      db_settings = get_db_settings(sqlcur)
-      check_db_settings(db_settings, options.action, options.email)
-      if options.action not in ['restore', 'restore-group', 'restore-mbox']:
-        if db_settings['db_version'] <  __db_schema_version__:
-          convertDB(sqlconn, db_settings['db_version'])
-          db_settings = get_db_settings(sqlcur)
-        if options.action == 'reindex':
-          getMessageIDs(sqlconn, options.local_folder)
-          rebuildUIDTable(sqlconn)
-          sqlconn.commit()
-          sys.exit(0)
-    else:
-      sqlconn = sqlite3.connect(':memory:')
-      sqlcur = sqlconn.cursor()
+  # Database connection setup
+  if options.use_postgres:
+    if not options.postgres_user:
+      print("ERROR: --postgres-user is required when using --use-postgres")
+      sys.exit(1)
+    if not options.postgres_password:
+      print("ERROR: --postgres-password is required when using --use-postgres")
+      sys.exit(1)
+      
+    sqldbfile = None  # Not used with PostgreSQL
+    newDB = False  # PostgreSQL tables are created if they don't exist
+    
+    # If we're not doing a estimate or similar action that doesn't need a DB
+    if options.action not in ['count', 'purge', 'purge-labels', 'print-labels',
+      'quota', 'revoke', 'create-label']:
+      if options.action not in ['estimate', 'restore-mbox', 'restore-group']:
+        print(f"\nUsing PostgreSQL database {options.postgres_db} on {options.postgres_host}:{options.postgres_port}")
+        global sqlconn
+        global sqlcur
+        sqlconn = connectPostgreSQL()
+        sqlcur = sqlconn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        initializePostgreSQL(sqlconn, options.email)
+        # For PostgreSQL, we'll store settings and check compatibility later
+      else:
+        # For estimate/restore operations, still need connection
+        sqlconn = connectPostgreSQL() 
+        sqlcur = sqlconn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+  else:
+    # Original SQLite logic
+    sqldbfile = os.path.join(options.local_folder, 'msg-db.sqlite')
+    # Do we need to initialize a new database?
+    newDB = not os.path.isfile(sqldbfile)
+    
+    # If we're not doing a estimate or if the db file actually exists we open it
+    # (creates db if it doesn't exist)
+    if options.action not in ['count', 'purge', 'purge-labels', 'print-labels',
+      'quota', 'revoke', 'create-label']:
+      if options.action not in ['estimate', 'restore-mbox', 'restore-group'] or os.path.isfile(sqldbfile):
+        print("\nUsing backup folder %s" % options.local_folder)
+        sqlite3.register_adapter(datetime.date, adapt_date_iso)
+        sqlite3.register_adapter(datetime.datetime, adapt_datetime_iso)
+        sqlite3.register_adapter(datetime.datetime, adapt_datetime_epoch)
+        sqlite3.register_converter("date", convert_date)
+        sqlite3.register_converter("datetime", convert_datetime)
+        sqlite3.register_converter("timestamp", convert_timestamp)
+        sqlconn = sqlite3.connect(sqldbfile,
+          detect_types=sqlite3.PARSE_DECLTYPES)
+        sqlcur = sqlconn.cursor()
+        if newDB:
+          initializeDB(sqlconn, options.email)
+        db_settings = get_db_settings(sqlcur)
+        check_db_settings(db_settings, options.action, options.email)
+        if options.action not in ['restore', 'restore-group', 'restore-mbox']:
+          if db_settings['db_version'] <  __db_schema_version__:
+            convertDB(sqlconn, db_settings['db_version'])
+            db_settings = get_db_settings(sqlcur)
+          if options.action == 'reindex':
+            getMessageIDs(sqlconn, options.local_folder)
+            rebuildUIDTable(sqlconn)
+            sqlconn.commit()
+            sys.exit(0)
+      else:
+        sqlconn = sqlite3.connect(':memory:')
+        sqlcur = sqlconn.cursor()
 
   # BACKUP #
   if options.action == 'backup':
@@ -2186,8 +2625,12 @@ def main(argv):
     # Determine which messages from the search we haven't processed before.
     print("GYB needs to examine %s messages" % len(messages_to_process))
     for message_num in messages_to_process:
-      if not newDB and message_is_backed_up(message_num['id'], sqlcur, sqlconn,
-        options.local_folder):
+      if options.use_postgres:
+        is_backed_up = message_is_backed_up_postgresql(message_num['id'], sqlcur)
+      else:
+        is_backed_up = not newDB and message_is_backed_up(message_num['id'], sqlcur, sqlconn, options.local_folder)
+      
+      if is_backed_up:
         messages_to_refresh.append(message_num['id'])
       else:
         messages_to_backup.append(message_num['id'])
@@ -2215,7 +2658,7 @@ def main(argv):
       gbatch.add(gmail.users().messages().get(userId='me',
         id=a_message, format='raw',
         fields='id,labelIds,internalDate,raw'),
-        callback=backup_message)
+        callback=backup_message_postgresql if options.use_postgres else backup_message)
       backed_up_messages += 1
     if len(gbatch._order) > 0:
       callGAPI(gbatch, None, soft_errors=True)
@@ -2270,8 +2713,12 @@ def main(argv):
     # Determine which messages from the search we haven't processed before.
     print("GYB needs to examine %s Chats" % len(messages_to_process))
     for message_num in messages_to_process:
-      if newDB or not message_is_backed_up(message_num['id'], sqlcur, sqlconn,
-              options.local_folder):
+      if options.use_postgres:
+        is_backed_up = message_is_backed_up_postgresql(message_num['id'], sqlcur)
+      else:
+        is_backed_up = not newDB and message_is_backed_up(message_num['id'], sqlcur, sqlconn, options.local_folder)
+      
+      if not is_backed_up:
         messages_to_backup.append(message_num['id'])
     print("GYB already has a backup of %s Chats" %
       (len(messages_to_process) - len(messages_to_backup)))
@@ -2871,10 +3318,12 @@ otaBytesByService,quotaType')
     #Determine which messages from the search we haven't processed before.
     print("GYB needs to examine %s messages" % len(messages_to_process))
     for message_num in messages_to_process:
-      if not newDB and os.path.isfile(sqldbfile) and message_is_backed_up(message_num['id'], sqlcur,
-        sqlconn, options.local_folder):
-        pass
+      if options.use_postgres:
+        is_backed_up = message_is_backed_up_postgresql(message_num['id'], sqlcur)
       else:
+        is_backed_up = not newDB and os.path.isfile(sqldbfile) and message_is_backed_up(message_num['id'], sqlcur, sqlconn, options.local_folder)
+      
+      if not is_backed_up:
         messages_to_estimate.append(message_num['id'])
     print("GYB already has a backup of %s messages" %
       (len(messages_to_process) - len(messages_to_estimate)))
