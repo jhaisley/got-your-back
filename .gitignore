@@ -61,6 +61,7 @@ gyb/
 oauth2service.json
 client_secrets.json
 *.sqlite
+.env
 
 # Prevents committing private key.
 privatekey.p12

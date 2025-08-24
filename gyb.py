@@ -82,6 +82,13 @@ import configparser
 import webbrowser
 import threading
 
+# PostgreSQL storage support (optional)
+try:
+    from postgres_storage import create_postgres_storage, is_postgres_available
+    POSTGRES_STORAGE_AVAILABLE = True
+except ImportError:
+    POSTGRES_STORAGE_AVAILABLE = False
+
 import httplib2
 import google.oauth2.service_account
 import google_auth_oauthlib.flow
@@ -180,6 +187,10 @@ parameter.')
     dest='vault',
     help='Optional: On restore and restore-mbox, restored messages will not be\
 visible in user\'s Gmail but are subject to Vault discovery/retention.')
+  parser.add_argument('--use-postgres',
+    action='store_true',
+    dest='use_postgres',
+    help='Use PostgreSQL database instead of SQLite file storage. Requires .env configuration.')
   parser.add_argument('--service-account',
     action='store_true',
     dest='service_account',
@@ -1489,22 +1500,30 @@ go grab a cup of coffee and then try this command again.
   sys.exit(3)
 
 def message_is_backed_up(message_num, sqlcur, sqlconn, backup_folder):
-    try:
-      sqlcur.execute('''
-         SELECT message_filename FROM uids NATURAL JOIN messages
-                where uid = ?''', ((message_num),))
-    except sqlite3.OperationalError as e:
-      if e.message == 'no such table: messages':
-        print("\n\nError: your backup database file appears to be corrupted.")
-      else:
-        print("SQL error:%s" % e)
-      sys.exit(8)
-    sqlresults = sqlcur.fetchall()
-    for x in sqlresults:
-      filename = x[0]
-      if os.path.isfile(os.path.join(backup_folder, filename)):
-        return True
-    return False
+    # Check if using PostgreSQL storage
+    if 'postgres_storage' in globals() and postgres_storage is not None:
+      # For PostgreSQL, check if message exists using duplicate detection logic
+      message_file_name = "%s.eml" % message_num
+      vault_id = postgres_storage.check_duplicate(message_num, options.email, message_file_name)
+      return vault_id is not None
+    else:
+      # Use original SQLite logic
+      try:
+        sqlcur.execute('''
+           SELECT message_filename FROM uids NATURAL JOIN messages
+                  where uid = ?''', ((message_num),))
+      except sqlite3.OperationalError as e:
+        if e.message == 'no such table: messages':
+          print("\n\nError: your backup database file appears to be corrupted.")
+        else:
+          print("SQL error:%s" % e)
+        sys.exit(8)
+      sqlresults = sqlcur.fetchall()
+      for x in sqlresults:
+        filename = x[0]
+        if os.path.isfile(os.path.join(backup_folder, filename)):
+          return True
+      return False
 
 def get_db_settings(sqlcur):
   try:
@@ -1836,35 +1855,64 @@ def backup_message(request_id, response, exception):
       time_for_sqlite = datetime.datetime.fromtimestamp(message_time)
     except (OSError, IOError, OverflowError):
       time_for_sqlite = datetime.datetime.fromtimestamp(86400) # minimal value Win accepts
-    message_rel_path = os.path.join(str(message_date.tm_year),
-                                    str(message_date.tm_mon),
-                                    str(message_date.tm_mday))
-    message_rel_filename = os.path.join(message_rel_path,
-                                        message_file_name)
-    message_full_path = os.path.join(options.local_folder,
-                                     message_rel_path)
-    message_full_filename = os.path.join(options.local_folder,
-                                     message_rel_filename)
-    if not os.path.isdir(message_full_path):
-      os.makedirs(message_full_path)
+    
     raw_message = str(response['raw'])
     full_message = base64.urlsafe_b64decode(raw_message)
-    with open(message_full_filename, 'wb') as f:
-      f.write(full_message)
-    sqlcur.execute("""
-             INSERT INTO messages (
-                         message_filename, 
-                         message_internaldate) VALUES (?, ?)""",
-                        (message_rel_filename,
-                         time_for_sqlite))
-    message_num = sqlcur.lastrowid
-    sqlcur.execute("""
-             REPLACE INTO uids (message_num, uid) VALUES (?, ?)""",
-                               (message_num, response['id']))
-    for label in labels:
+    
+    # Check if using PostgreSQL storage
+    if 'postgres_storage' in globals() and postgres_storage is not None:
+      # Use PostgreSQL storage
+      message_id = response.get('id', '')
+      thread_id = response.get('threadId', '')
+      gmail_thread_id = response.get('threadId', '')
+      gmail_message_id = response.get('id', '')
+      
+      # Check for duplicates using PostgreSQL logic
+      vault_id = postgres_storage.check_duplicate(message_id, options.email, message_file_name)
+      if vault_id:
+        print(f"Message {message_id} already exists in PostgreSQL vault (vault_id: {vault_id})")
+        return
+        
+      # Store message in PostgreSQL
+      vault_id = postgres_storage.store_message(
+        full_message, message_id, thread_id, gmail_thread_id, 
+        gmail_message_id, labels, options.email, message_file_name
+      )
+      
+      if vault_id:
+        print(f"Message {message_id} stored in PostgreSQL vault (vault_id: {vault_id})")
+      else:
+        print(f"ERROR: Failed to store message {message_id} in PostgreSQL")
+        
+    else:
+      # Use original SQLite + file storage
+      message_rel_path = os.path.join(str(message_date.tm_year),
+                                      str(message_date.tm_mon),
+                                      str(message_date.tm_mday))
+      message_rel_filename = os.path.join(message_rel_path,
+                                          message_file_name)
+      message_full_path = os.path.join(options.local_folder,
+                                       message_rel_path)
+      message_full_filename = os.path.join(options.local_folder,
+                                       message_rel_filename)
+      if not os.path.isdir(message_full_path):
+        os.makedirs(message_full_path)
+      with open(message_full_filename, 'wb') as f:
+        f.write(full_message)
       sqlcur.execute("""
-           INSERT INTO labels (message_num, label) VALUES (?, ?)""",
-                              (message_num, label))
+               INSERT INTO messages (
+                           message_filename, 
+                           message_internaldate) VALUES (?, ?)""",
+                          (message_rel_filename,
+                           time_for_sqlite))
+      message_num = sqlcur.lastrowid
+      sqlcur.execute("""
+               REPLACE INTO uids (message_num, uid) VALUES (?, ?)""",
+                                 (message_num, response['id']))
+      for label in labels:
+        sqlcur.execute("""
+             INSERT INTO labels (message_num, label) VALUES (?, ?)""",
+                                (message_num, label))
 
 def _createHttpObj(cache=None, timeout=600):
   http_args = {'cache': cache, 'timeout': timeout}
@@ -2136,36 +2184,55 @@ def main(argv):
   newDB = not os.path.isfile(sqldbfile)
   
   # If we're not doing a estimate or if the db file actually exists we open it
-  # (creates db if it doesn't exist)
+  # Initialize database storage (SQLite or PostgreSQL)
   if options.action not in ['count', 'purge', 'purge-labels', 'print-labels',
     'quota', 'revoke', 'create-label']:
     if options.action not in ['estimate', 'restore-mbox', 'restore-group'] or os.path.isfile(sqldbfile):
       print("\nUsing backup folder %s" % options.local_folder)
       global sqlconn
       global sqlcur
-      sqlite3.register_adapter(datetime.date, adapt_date_iso)
-      sqlite3.register_adapter(datetime.datetime, adapt_datetime_iso)
-      sqlite3.register_adapter(datetime.datetime, adapt_datetime_epoch)
-      sqlite3.register_converter("date", convert_date)
-      sqlite3.register_converter("datetime", convert_datetime)
-      sqlite3.register_converter("timestamp", convert_timestamp)
-      sqlconn = sqlite3.connect(sqldbfile,
-        detect_types=sqlite3.PARSE_DECLTYPES)
-      sqlcur = sqlconn.cursor()
-      if newDB:
-        initializeDB(sqlconn, options.email)
-      db_settings = get_db_settings(sqlcur)
-      check_db_settings(db_settings, options.action, options.email)
-      if options.action not in ['restore', 'restore-group', 'restore-mbox']:
-        if db_settings['db_version'] <  __db_schema_version__:
-          convertDB(sqlconn, db_settings['db_version'])
-          db_settings = get_db_settings(sqlcur)
-        if options.action == 'reindex':
-          getMessageIDs(sqlconn, options.local_folder)
-          rebuildUIDTable(sqlconn)
-          sqlconn.commit()
-          sys.exit(0)
+      global postgres_storage
+      postgres_storage = None
+      
+      # Check if PostgreSQL storage should be used
+      if getattr(options, 'use_postgres', False):
+        if not POSTGRES_STORAGE_AVAILABLE:
+          print("ERROR: PostgreSQL support not available. Install requirements: pip install psycopg[binary] python-dotenv")
+          sys.exit(1)
+        print("Initializing PostgreSQL storage...")
+        postgres_storage = create_postgres_storage()
+        if not postgres_storage:
+          print("ERROR: Failed to initialize PostgreSQL storage. Check .env configuration.")
+          sys.exit(1)
+        # Create dummy SQLite connection for compatibility
+        sqlconn = sqlite3.connect(':memory:')
+        sqlcur = sqlconn.cursor()
+      else:
+        # Use original SQLite logic
+        sqlite3.register_adapter(datetime.date, adapt_date_iso)
+        sqlite3.register_adapter(datetime.datetime, adapt_datetime_iso)
+        sqlite3.register_adapter(datetime.datetime, adapt_datetime_epoch)
+        sqlite3.register_converter("date", convert_date)
+        sqlite3.register_converter("datetime", convert_datetime)
+        sqlite3.register_converter("timestamp", convert_timestamp)
+        sqlconn = sqlite3.connect(sqldbfile,
+          detect_types=sqlite3.PARSE_DECLTYPES)
+        sqlcur = sqlconn.cursor()
+        if newDB:
+          initializeDB(sqlconn, options.email)
+        db_settings = get_db_settings(sqlcur)
+        check_db_settings(db_settings, options.action, options.email)
+        if options.action not in ['restore', 'restore-group', 'restore-mbox']:
+          if db_settings['db_version'] <  __db_schema_version__:
+            convertDB(sqlconn, db_settings['db_version'])
+            db_settings = get_db_settings(sqlcur)
+          if options.action == 'reindex':
+            getMessageIDs(sqlconn, options.local_folder)
+            rebuildUIDTable(sqlconn)
+            sqlconn.commit()
+            sys.exit(0)
     else:
+      postgres_storage = None
       sqlconn = sqlite3.connect(':memory:')
       sqlcur = sqlconn.cursor()
 
@@ -2910,6 +2977,8 @@ if __name__ == '__main__':
       raise
   except KeyboardInterrupt:
     try:
+      if 'postgres_storage' in globals() and postgres_storage is not None:
+        postgres_storage.disconnect()
       sqlconn.commit()
       sqlconn.close()
       print()
