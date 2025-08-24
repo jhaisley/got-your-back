@@ -72,6 +72,12 @@ try:
   PSYCOPG2_AVAILABLE = True
 except ImportError:
   PSYCOPG2_AVAILABLE = False
+try:
+  import psycopg2
+  import psycopg2.extras
+  PSYCOPG2_AVAILABLE = True
+except ImportError:
+  PSYCOPG2_AVAILABLE = False
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import (format_datetime,
@@ -1672,6 +1678,131 @@ def rewrite_line(mystring):
   else:
     print()
   print(mystring, end='\r')
+
+def connectPostgreSQL():
+  """Establish PostgreSQL database connection"""
+  if not PSYCOPG2_AVAILABLE:
+    print("ERROR: psycopg2 not available. Please install with: pip install psycopg2-binary")
+    sys.exit(1)
+  
+  try:
+    conn = psycopg2.connect(
+      host=options.postgres_host,
+      port=options.postgres_port,
+      database=options.postgres_db,
+      user=options.postgres_user,
+      password=options.postgres_password
+    )
+    conn.autocommit = False
+    return conn
+  except psycopg2.Error as e:
+    print(f"ERROR: Cannot connect to PostgreSQL database: {e}")
+    sys.exit(1)
+
+def initializePostgreSQL(pgconn, email):
+  """Initialize PostgreSQL database schema"""
+  pgcur = pgconn.cursor()
+  
+  # Create primary maildata table
+  pgcur.execute('''
+    CREATE TABLE IF NOT EXISTS maildata (
+      vaultid SERIAL PRIMARY KEY,
+      "Message-ID" VARCHAR NOT NULL,
+      "Original-File" VARCHAR NOT NULL,
+      "Message-Path" VARCHAR NOT NULL,
+      "Derivatives-Path" VARCHAR NOT NULL,
+      attachments INTEGER DEFAULT 0,
+      "Full Headers" JSONB NOT NULL,
+      date TIMESTAMP WITH TIME ZONE,
+      "From" VARCHAR,
+      "To" VARCHAR,
+      cc VARCHAR,
+      bcc VARCHAR,
+      subject VARCHAR,
+      "Content-Type" VARCHAR,
+      mboxusername VARCHAR,
+      error TEXT,
+      defects TEXT,
+      defects_categories TEXT,
+      delivered_to VARCHAR,
+      received VARCHAR,
+      uid TEXT,
+      internal_date TIMESTAMP WITH TIME ZONE,
+      labels TEXT[] DEFAULT '{}'
+    )
+  ''')
+  
+  # Create maildetail table
+  pgcur.execute('''
+    CREATE TABLE IF NOT EXISTS maildetail (
+      vaultid INTEGER REFERENCES maildata(vaultid) ON DELETE CASCADE,
+      "Message-ID" VARCHAR,
+      "Body-Original" TEXT,
+      "Body-PlainText" TEXT,
+      text_not_managed TEXT
+    )
+  ''')
+  
+  # Create mailattachments table
+  pgcur.execute('''
+    CREATE TABLE IF NOT EXISTS mailattachments (
+      vaultid INTEGER REFERENCES maildata(vaultid) ON DELETE CASCADE,
+      "Message-ID" VARCHAR,
+      "Content-Type" VARCHAR,
+      "Content-Encoding" VARCHAR,
+      "Content-Filename" VARCHAR,
+      "Content-Data" BYTEA
+    )
+  ''')
+  
+  # Create audit_log table
+  pgcur.execute('''
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id SERIAL PRIMARY KEY,
+      external_username VARCHAR,
+      action VARCHAR,
+      details JSONB,
+      timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    )
+  ''')
+  
+  # Create settings table for compatibility
+  pgcur.execute('''
+    CREATE TABLE IF NOT EXISTS settings (
+      name VARCHAR PRIMARY KEY,
+      value TEXT
+    )
+  ''')
+  
+  # Insert settings
+  pgcur.execute('''
+    INSERT INTO settings (name, value) VALUES (%s, %s)
+    ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value
+  ''', ('email_address', email))
+  
+  pgcur.execute('''
+    INSERT INTO settings (name, value) VALUES (%s, %s)
+    ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value
+  ''', ('db_version', __db_schema_version__))
+  
+  # Create indexes for performance
+  pgcur.execute('''
+    CREATE INDEX IF NOT EXISTS idx_maildata_messageid 
+    ON maildata("Message-ID")
+  ''')
+  
+  pgcur.execute('''
+    CREATE INDEX IF NOT EXISTS idx_maildata_mboxusername_messageid 
+    ON maildata(mboxusername, "Message-ID")
+  ''')
+  
+  pgcur.execute('''
+    CREATE INDEX IF NOT EXISTS idx_maildata_labels 
+    ON maildata USING GIN(labels)
+  ''')
+  
+  pgconn.commit()
+  pgcur.close()
 
 def connectPostgreSQL():
   """Establish PostgreSQL database connection"""
