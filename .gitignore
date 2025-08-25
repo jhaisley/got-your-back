@@ -72,3 +72,4 @@ privatekey.p12
 *.tar.xz
 *.wixobj
 *.wixpdb
+.env
