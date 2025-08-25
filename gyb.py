@@ -23,7 +23,7 @@ and provides the same interface as the original gyb.py script.
 The functionality has been broken down into logical modules:
 - gyb.main: Main entry point and coordination
 - gyb.cli: Command line argument parsing
-- gyb.auth: Authentication and OAuth handling  
+- gyb.auth: Authentication and OAuth handling
 - gyb.google_api: Google API interactions
 - gyb.database: SQLite database operations
 - gyb.actions: Backup and restore actions
@@ -32,10 +32,12 @@ The functionality has been broken down into logical modules:
 
 import sys
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     # Import and run the modular version
     from gyb.main import main
+
     main(sys.argv[1:])
 else:
     # When imported as a module, expose the library interface
+    # trunk-ignore(ruff/F403)
     from gyb import *
